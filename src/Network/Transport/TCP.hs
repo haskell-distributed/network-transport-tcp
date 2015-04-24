@@ -113,6 +113,8 @@ import Control.Exception
   , bracketOnError
   , fromException
   , catch
+  , mask_
+  , uninterruptibleMask_
   )
 import Data.IORef (IORef, newIORef, writeIORef, readIORef)
 import Data.ByteString (ByteString)
@@ -637,7 +639,7 @@ apiSend :: EndPointPair             -- ^ Local and remote endpoint
         -> IO (Either (TransportError SendErrorCode) ())
 apiSend (ourEndPoint, theirEndPoint) connId connAlive payload =
     -- We don't need the overhead of asyncWhenCancelled here
-    try . mapIOException sendFailed $ do
+    try . mapIOException sendFailed $ mask_ $ do
       act <- withMVar (remoteState theirEndPoint) $ \st -> case st of
         RemoteEndPointInvalid _ ->
           relyViolation (ourEndPoint, theirEndPoint) "apiSend"
@@ -917,7 +919,7 @@ handleIncomingMessages (ourEndPoint, theirEndPoint) = do
 
     -- Close the socket (if we don't have any outgoing connections)
     closeSocket :: N.Socket -> LightweightConnectionId -> IO Bool
-    closeSocket sock lastReceivedId = do
+    closeSocket sock lastReceivedId = mask_ $ do
       mAct <- modifyMVar theirState $ \st -> do
         case st of
           RemoteEndPointInvalid _ ->
@@ -1450,7 +1452,7 @@ schedule theirEndPoint act = do
 -- 'runScheduledAction' or by another).
 runScheduledAction :: EndPointPair -> Action a -> IO a
 runScheduledAction (ourEndPoint, theirEndPoint) mvar = do
-    join $ readChan (remoteScheduled theirEndPoint)
+    join $ uninterruptibleMask_ $ readChan (remoteScheduled theirEndPoint)
     ma <- readMVar mvar
     case ma of
       Right a -> return a
