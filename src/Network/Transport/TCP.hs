@@ -48,6 +48,10 @@ import Network.Transport.TCP.Internal
   , recvWithLength
   , recvInt32
   , tryCloseSocket
+  , LockingChan
+  , newLockingChan
+  , withLockingChan
+  , unsafeWithLockingChan
   )
 import Network.Transport.Internal
   ( encodeInt32
@@ -365,7 +369,7 @@ data RemoteEndPoint = RemoteEndPoint
   { remoteAddress   :: !EndPointAddress
   , remoteState     :: !(MVar RemoteState)
   , remoteId        :: !HeavyweightConnectionId
-  , remoteScheduled :: !(Chan (IO ()))
+  , remoteScheduled :: !(LockingChan (IO ()))
   }
 
 data RequestedBy = RequestedByUs | RequestedByThem
@@ -1347,7 +1351,7 @@ findRemoteEndPoint ourEndPoint theirAddress findOrigin = go
             resolved   <- newEmptyMVar
             crossed    <- newEmptyMVar
             theirState <- newMVar (RemoteEndPointInit resolved crossed findOrigin)
-            scheduled  <- newChan
+            scheduled  <- newLockingChan
             let theirEndPoint = RemoteEndPoint
                                   { remoteAddress   = theirAddress
                                   , remoteState     = theirState
@@ -1434,8 +1438,8 @@ type Action a = MVar (Either SomeException a)
 schedule :: RemoteEndPoint -> IO a -> IO (Action a)
 schedule theirEndPoint act = do
   mvar <- newEmptyMVar
-  writeChan (remoteScheduled theirEndPoint) $
-    catch (act >>= putMVar mvar . Right) (putMVar mvar . Left)
+  unsafeWithLockingChan (remoteScheduled theirEndPoint) $ flip writeChan
+    (catch (act >>= putMVar mvar . Right) (putMVar mvar . Left))
   return mvar
 
 -- | Run a scheduled action. Every call to 'schedule' should be paired with a
@@ -1450,7 +1454,7 @@ schedule theirEndPoint act = do
 -- 'runScheduledAction' or by another).
 runScheduledAction :: EndPointPair -> Action a -> IO a
 runScheduledAction (ourEndPoint, theirEndPoint) mvar = do
-    join $ readChan (remoteScheduled theirEndPoint)
+    withLockingChan (remoteScheduled theirEndPoint) $ \ch -> join $ readChan ch
     ma <- readMVar mvar
     case ma of
       Right a -> return a
