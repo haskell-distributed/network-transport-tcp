@@ -1,3 +1,9 @@
+2015-06-15 FacundoDominguez <facundo.dominguez@tweag.io> 0.4.2
+
+* Update dependencies.
+* Fixes in test-suite.
+* Bug fixes DP-109, NTTCP-11.
+
 2014-12-09  Tim Watson  <watson.timothy@gmail.com>  0.4.1
 
 * Update dependencies
