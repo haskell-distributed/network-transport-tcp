@@ -501,7 +501,7 @@ testUnnecessaryConnect numThreads = do
 
   forkTry $ do
     -- We pick an address < 127.0.0.1 so that this is not rejected purely because of the "crossed" check
-    let ourAddress = EndPointAddress "126.0.0.1"
+    let ourAddress = EndPointAddress "126.0.0.1:9999:0"
 
     -- We should only get a single 'Accepted' reply
     gotAccepted <- newEmptyMVar
