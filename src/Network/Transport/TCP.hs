@@ -19,6 +19,9 @@ module Network.Transport.TCP
     createTransport
   , TCPParameters(..)
   , defaultTCPParameters
+  , Policy
+  , PolicyDecision(..)
+  , Accept(..)
     -- * Internals (exposed for unit tests)
   , createTransportExposeInternals
   , TransportInternals(..)
@@ -151,7 +154,6 @@ import qualified Data.Accessor.Container as DAC (mapMaybe)
 import Data.Foldable (forM_, mapM_)
 import qualified System.Timeout (timeout)
 
-
 -- $design
 --
 -- [Goals]
@@ -283,6 +285,7 @@ data LocalEndPoint = LocalEndPoint
   { localAddress :: !EndPointAddress
   , localChannel :: !(Chan Event)
   , localState   :: !(MVar LocalEndPointState)
+  , localPolicy  :: Policy
   }
 
 data LocalEndPointState =
@@ -501,11 +504,27 @@ data TransportInternals = TransportInternals
   , socketBetween :: EndPointAddress
                   -> EndPointAddress
                   -> IO N.Socket
+  , newEndPointInternal
+      :: Policy
+      -> IO (Either (TransportError NewEndPointErrorCode) EndPoint)
   }
 
 --------------------------------------------------------------------------------
 -- Top-level functionality                                                    --
 --------------------------------------------------------------------------------
+
+type Policy = EndPointAddress -> PolicyDecision
+
+newtype PolicyDecision = PolicyDecision {
+    getPolicyDecision :: IO (Accept, PolicyDecision)
+  }
+
+data Accept = Accept | Block (IO ())
+
+acceptPolicy :: Policy
+acceptPolicy _ = alwaysAccept
+  where
+  alwaysAccept = PolicyDecision (return (Accept, alwaysAccept))
 
 -- | Create a TCP transport
 createTransport :: N.HostName
@@ -558,7 +577,7 @@ createTransportExposeInternals host port params = do
                 -> IO (Transport, TransportInternals)
     mkTransport transport tid = return
       ( Transport
-          { newEndPoint    = apiNewEndPoint transport
+          { newEndPoint    = apiNewEndPoint transport acceptPolicy
           , closeTransport = let evs = [ EndPointClosed
                                        , throw $ userError "Transport closed"
                                        ] in
@@ -567,6 +586,7 @@ createTransportExposeInternals host port params = do
       , TransportInternals
           { transportThread = tid
           , socketBetween   = internalSocketBetween transport
+          , newEndPointInternal = apiNewEndPoint transport
           }
       )
 
@@ -608,10 +628,11 @@ apiCloseTransport transport mTransportThread evs =
 
 -- | Create a new endpoint
 apiNewEndPoint :: TCPTransport
+               -> Policy
                -> IO (Either (TransportError NewEndPointErrorCode) EndPoint)
-apiNewEndPoint transport =
+apiNewEndPoint transport policy =
   try . asyncWhenCancelled closeEndPoint $ do
-    ourEndPoint <- createLocalEndPoint transport
+    ourEndPoint <- createLocalEndPoint transport policy
     return EndPoint
       { receive       = readChan (localChannel ourEndPoint)
       , address       = localAddress ourEndPoint
@@ -839,7 +860,8 @@ handleConnectionRequest transport sock = handle handleException $ do
       -- been recorded as part of the remote endpoint. Either way, we no longer
       -- have to worry about closing the socket on receiving an asynchronous
       -- exception from this point forward.
-      forM_ mEndPoint $ handleIncomingMessages . (,) ourEndPoint
+      let policyDecision = localPolicy ourEndPoint theirAddress
+      forM_ mEndPoint $ handleIncomingMessages policyDecision . (,) ourEndPoint
 
     handleException :: SomeException -> IO ()
     handleException ex = do
@@ -881,8 +903,8 @@ handleConnectionRequest transport sock = handle handleException $ do
 --
 -- Returns only if the remote party closes the socket or if an error occurs.
 -- This runs in a thread that will never be killed.
-handleIncomingMessages :: EndPointPair -> IO ()
-handleIncomingMessages (ourEndPoint, theirEndPoint) = do
+handleIncomingMessages :: PolicyDecision -> EndPointPair -> IO ()
+handleIncomingMessages policyDecision (ourEndPoint, theirEndPoint) = do
     mSock <- withMVar theirState $ \st ->
       case st of
         RemoteEndPointInvalid _ ->
@@ -901,7 +923,7 @@ handleIncomingMessages (ourEndPoint, theirEndPoint) = do
           return Nothing
 
     forM_ mSock $ \sock ->
-      tryIO (go sock) >>= either (prematureExit sock) return
+      tryIO (go (localState ourEndPoint) policyDecision sock) >>= either (prematureExit sock) return
   where
     -- Dispatch
     --
@@ -911,24 +933,39 @@ handleIncomingMessages (ourEndPoint, theirEndPoint) = do
     -- (because a 'send' failed) -- the individual handlers below will throw a
     -- user exception which is then caught and handled the same way as an
     -- exception thrown by 'recv'.
-    go :: N.Socket -> IO ()
-    go sock = do
+    go :: MVar LocalEndPointState -> PolicyDecision -> N.Socket -> IO ()
+    go localEndPointState policyDecision sock = do
+      (decision, policyDecision') <- getPolicyDecision policyDecision
+      () <- case decision of
+        Accept -> return ()
+        -- TODO
+        -- In case we block, we want to stop if the socket is closed. There's
+        -- no need to continue the 'until' IO if the LocalEndPoint closes.
+        -- This could accomplished by bringing in STM and using a TVar for
+        -- the LocalEndPointState. But it's not a big deal.
+        Block until -> until
+      -- Never touch the socket if it's been closed, for it's possible that
+      -- our LocalEndPoint has closed, and some other LocalEndPoint has
+      -- connected to the same RemoteEndPoint, and the handle is reused. We
+      -- could therefore receive data that's intended for some other
+      -- LocalEndPoint.
+      _ <- checkForClosedLocalEndPoint localEndPointState
       lcid <- recvInt32 sock :: IO LightweightConnectionId
       if lcid >= firstNonReservedLightweightConnectionId
         then do
           readMessage sock lcid
-          go sock
+          go localEndPointState policyDecision' sock
         else
           case tryToEnum (fromIntegral lcid) of
             Just CreatedNewConnection -> do
               recvInt32 sock >>= createdNewConnection
-              go sock
+              go localEndPointState policyDecision' sock
             Just CloseConnection -> do
               recvInt32 sock >>= closeConnection
-              go sock
+              go localEndPointState policyDecision' sock
             Just CloseSocket -> do
               didClose <- recvInt32 sock >>= closeSocket sock
-              unless didClose $ go sock
+              unless didClose $ go localEndPointState policyDecision' sock
             Just CloseEndPoint -> do
               let closeRemoteEndPoint vst = do
                     forM_ (remoteProbing vst) id
@@ -954,10 +991,10 @@ handleIncomingMessages (ourEndPoint, theirEndPoint) = do
               tryCloseSocket sock
             Just ProbeSocket -> do
               forkIO $ sendMany sock [encodeInt32 ProbeSocketAck]
-              go sock
+              go localEndPointState policyDecision' sock
             Just ProbeSocketAck -> do
               stopProbing
-              go sock
+              go localEndPointState policyDecision' sock
             Nothing ->
               throwIO $ userError "Invalid control request"
 
@@ -966,10 +1003,10 @@ handleIncomingMessages (ourEndPoint, theirEndPoint) = do
     createdNewConnection lcid = do
       modifyMVar_ theirState $ \st -> do
         vst <- case st of
-          RemoteEndPointInvalid _ ->
+          RemoteEndPointInvalid _ -> do
             relyViolation (ourEndPoint, theirEndPoint)
               "handleIncomingMessages:createNewConnection (invalid)"
-          RemoteEndPointInit _ _ _ ->
+          RemoteEndPointInit _ _ _ -> do
             relyViolation (ourEndPoint, theirEndPoint)
               "handleIncomingMessages:createNewConnection (init)"
           RemoteEndPointValid vst ->
@@ -989,9 +1026,9 @@ handleIncomingMessages (ourEndPoint, theirEndPoint) = do
                    . (remoteMaxIncoming ^= lcid)
                    $ vst
                    )
-          RemoteEndPointFailed err ->
+          RemoteEndPointFailed err -> do
             throwIO err
-          RemoteEndPointClosed ->
+          RemoteEndPointClosed -> do
             relyViolation (ourEndPoint, theirEndPoint)
               "createNewConnection (closed)"
         return (RemoteEndPointValid vst)
@@ -1143,6 +1180,11 @@ handleIncomingMessages (ourEndPoint, theirEndPoint) = do
           RemoteEndPointFailed err' ->
             return (RemoteEndPointFailed err')
 
+    checkForClosedLocalEndPoint :: MVar LocalEndPointState -> IO ()
+    checkForClosedLocalEndPoint localEndPointState = withMVar localEndPointState $ \state -> case state of
+      LocalEndPointClosed -> throwIO $ userError "stale socket"
+      LocalEndPointValid _ -> return ()
+
     -- Construct a connection ID
     connId :: LightweightConnectionId -> ConnectionId
     connId = createConnectionId (remoteId theirEndPoint)
@@ -1284,8 +1326,9 @@ setupRemoteEndPoint params (ourEndPoint, theirEndPoint) connTimeout = do
         resolveInit (ourEndPoint, theirEndPoint) (RemoteEndPointInvalid err)
         return False
 
+    let policyDecision = localPolicy ourEndPoint theirAddress
     when didAccept $ void $ forkIO $
-      handleIncomingMessages (ourEndPoint, theirEndPoint)
+      handleIncomingMessages policyDecision (ourEndPoint, theirEndPoint)
     return $ either (const Nothing) (Just . snd) result
   where
     ourAddress      = localAddress ourEndPoint
@@ -1420,8 +1463,8 @@ getLocalNextConnOutId ourEndpoint =
 --
 -- May throw a TransportError NewEndPointErrorCode exception if the transport
 -- is closed.
-createLocalEndPoint :: TCPTransport -> IO LocalEndPoint
-createLocalEndPoint transport = do
+createLocalEndPoint :: TCPTransport -> Policy -> IO LocalEndPoint
+createLocalEndPoint transport policy = do
     chan  <- newChan
     state <- newMVar . LocalEndPointValid $ ValidLocalEndPointState
       { _localNextConnOutId = firstNonReservedLightweightConnectionId
@@ -1437,6 +1480,7 @@ createLocalEndPoint transport = do
         let localEndPoint = LocalEndPoint { localAddress  = addr
                                           , localChannel  = chan
                                           , localState    = state
+                                          , localPolicy   = policy
                                           }
         return ( TransportValid
                . (localEndPointAt addr ^= Just localEndPoint)
