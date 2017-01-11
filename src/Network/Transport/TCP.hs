@@ -154,7 +154,6 @@ import qualified Data.Accessor.Container as DAC (mapMaybe)
 import Data.Foldable (forM_, mapM_)
 import qualified System.Timeout (timeout)
 
-
 -- $design
 --
 -- [Goals]
@@ -924,7 +923,7 @@ handleIncomingMessages policyDecision (ourEndPoint, theirEndPoint) = do
           return Nothing
 
     forM_ mSock $ \sock ->
-      tryIO (go policyDecision sock) >>= either (prematureExit sock) return
+      tryIO (go (localState ourEndPoint) policyDecision sock) >>= either (prematureExit sock) return
   where
     -- Dispatch
     --
@@ -934,28 +933,39 @@ handleIncomingMessages policyDecision (ourEndPoint, theirEndPoint) = do
     -- (because a 'send' failed) -- the individual handlers below will throw a
     -- user exception which is then caught and handled the same way as an
     -- exception thrown by 'recv'.
-    go :: PolicyDecision -> N.Socket -> IO ()
-    go policyDecision sock = do
+    go :: MVar LocalEndPointState -> PolicyDecision -> N.Socket -> IO ()
+    go localEndPointState policyDecision sock = do
       (decision, policyDecision') <- getPolicyDecision policyDecision
-      case decision of
+      () <- case decision of
         Accept -> return ()
+        -- TODO
+        -- In case we block, we want to stop if the socket is closed. There's
+        -- no need to continue the 'until' IO if the LocalEndPoint closes.
+        -- This could accomplished by bringing in STM and using a TVar for
+        -- the LocalEndPointState. But it's not a big deal.
         Block until -> until
+      -- Never touch the socket if it's been closed, for it's possible that
+      -- our LocalEndPoint has closed, and some other LocalEndPoint has
+      -- connected to the same RemoteEndPoint, and the handle is reused. We
+      -- could therefore receive data that's intended for some other
+      -- LocalEndPoint.
+      _ <- checkForClosedLocalEndPoint localEndPointState
       lcid <- recvInt32 sock :: IO LightweightConnectionId
       if lcid >= firstNonReservedLightweightConnectionId
         then do
           readMessage sock lcid
-          go policyDecision' sock
+          go localEndPointState policyDecision' sock
         else
           case tryToEnum (fromIntegral lcid) of
             Just CreatedNewConnection -> do
               recvInt32 sock >>= createdNewConnection
-              go policyDecision' sock
+              go localEndPointState policyDecision' sock
             Just CloseConnection -> do
               recvInt32 sock >>= closeConnection
-              go policyDecision' sock
+              go localEndPointState policyDecision' sock
             Just CloseSocket -> do
               didClose <- recvInt32 sock >>= closeSocket sock
-              unless didClose $ go policyDecision' sock
+              unless didClose $ go localEndPointState policyDecision' sock
             Just CloseEndPoint -> do
               let closeRemoteEndPoint vst = do
                     forM_ (remoteProbing vst) id
@@ -981,10 +991,10 @@ handleIncomingMessages policyDecision (ourEndPoint, theirEndPoint) = do
               tryCloseSocket sock
             Just ProbeSocket -> do
               forkIO $ sendMany sock [encodeInt32 ProbeSocketAck]
-              go policyDecision' sock
+              go localEndPointState policyDecision' sock
             Just ProbeSocketAck -> do
               stopProbing
-              go policyDecision' sock
+              go localEndPointState policyDecision' sock
             Nothing ->
               throwIO $ userError "Invalid control request"
 
@@ -993,10 +1003,10 @@ handleIncomingMessages policyDecision (ourEndPoint, theirEndPoint) = do
     createdNewConnection lcid = do
       modifyMVar_ theirState $ \st -> do
         vst <- case st of
-          RemoteEndPointInvalid _ ->
+          RemoteEndPointInvalid _ -> do
             relyViolation (ourEndPoint, theirEndPoint)
               "handleIncomingMessages:createNewConnection (invalid)"
-          RemoteEndPointInit _ _ _ ->
+          RemoteEndPointInit _ _ _ -> do
             relyViolation (ourEndPoint, theirEndPoint)
               "handleIncomingMessages:createNewConnection (init)"
           RemoteEndPointValid vst ->
@@ -1016,9 +1026,9 @@ handleIncomingMessages policyDecision (ourEndPoint, theirEndPoint) = do
                    . (remoteMaxIncoming ^= lcid)
                    $ vst
                    )
-          RemoteEndPointFailed err ->
+          RemoteEndPointFailed err -> do
             throwIO err
-          RemoteEndPointClosed ->
+          RemoteEndPointClosed -> do
             relyViolation (ourEndPoint, theirEndPoint)
               "createNewConnection (closed)"
         return (RemoteEndPointValid vst)
@@ -1169,6 +1179,11 @@ handleIncomingMessages policyDecision (ourEndPoint, theirEndPoint) = do
               "handleIncomingMessages:prematureExit"
           RemoteEndPointFailed err' ->
             return (RemoteEndPointFailed err')
+
+    checkForClosedLocalEndPoint :: MVar LocalEndPointState -> IO ()
+    checkForClosedLocalEndPoint localEndPointState = withMVar localEndPointState $ \state -> case state of
+      LocalEndPointClosed -> throwIO $ userError "stale socket"
+      LocalEndPointValid _ -> return ()
 
     -- Construct a connection ID
     connId :: LightweightConnectionId -> ConnectionId
