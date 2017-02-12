@@ -772,8 +772,15 @@ apiSend (ourEndPoint, theirEndPoint) connId connAlive payload =
         RemoteEndPointValid vst -> do
           alive <- readIORef connAlive
           if alive
-            then sched theirEndPoint $
-              sendOn vst (encodeInt32 connId : prependLength payload)
+            then sched theirEndPoint $ case payload of
+              -- If there's no bytes, don't put anything on the wire.
+              [] -> pure ()
+              -- If there are bytes, send them with a connection id and length
+              -- prefix. This includes 0-length input such as
+              --   [""]
+              --   ["", ""]
+              --   etc.
+              _ -> sendOn vst (encodeInt32 connId : prependLength payload)
             else throwIO $ TransportError SendClosed "Connection closed"
         RemoteEndPointClosing _ _ -> do
           alive <- readIORef connAlive

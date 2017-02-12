@@ -128,6 +128,12 @@ recvExact :: N.Socket                -- ^ Socket to read from
           -> Int32                   -- ^ Number of bytes to read
           -> IO [ByteString]
 recvExact _ len | len < 0 = throwIO (userError "recvExact: Negative length")
+recvExact sock len | len == 0 = do
+  -- Special handling for reading 0 bytes. In the positive case we loop until
+  -- the number of outstanding bytes is 0, and don't read on the 0 case, but
+  -- here we must read exactly 0 bytes.
+  bs <- NBS.recv sock 0
+  pure [bs]
 recvExact sock len = go [] len
   where
     go :: [ByteString] -> Int32 -> IO [ByteString]
