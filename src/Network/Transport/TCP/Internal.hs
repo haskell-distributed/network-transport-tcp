@@ -5,6 +5,11 @@ module Network.Transport.TCP.Internal
   , recvExact
   , recvInt32
   , tryCloseSocket
+  -- LockingChan
+  , LockingChan
+  , newLockingChan
+  , withLockingChan
+  , unsafeWithLockingChan
   ) where
 
 #if ! MIN_VERSION_base(4,6,0)
@@ -44,6 +49,8 @@ import qualified Network.Socket.ByteString as NBS (recv)
 #endif
 
 import Control.Concurrent (ThreadId)
+import Control.Concurrent.MVar
+import Control.Concurrent.Chan
 import Control.Monad (forever, when)
 import Control.Exception (SomeException, catch, bracketOnError, throwIO, mask_)
 import Control.Applicative ((<$>), (<*>))
@@ -137,3 +144,14 @@ recvExact sock len = go [] len
       if BS.null bs
         then throwIO (userError "recvExact: Socket closed")
         else go (bs : acc) (l - fromIntegral (BS.length bs))
+
+data LockingChan a = LC !(MVar ()) !(Chan a)
+
+newLockingChan :: IO (LockingChan a)
+newLockingChan = LC <$> newMVar () <*> newChan
+
+withLockingChan :: LockingChan a -> (Chan a -> IO b) -> IO b
+withLockingChan (LC lock chan) f = withMVar lock (const $ f chan)
+
+unsafeWithLockingChan :: LockingChan a -> (Chan a -> IO b) -> IO b
+unsafeWithLockingChan (LC _ ch) f = f ch
