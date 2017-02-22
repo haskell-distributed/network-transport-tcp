@@ -95,11 +95,11 @@ decodeControlHeader w32 = case w32 of
 encodeControlHeader :: ControlHeader -> Word32
 encodeControlHeader ch = case ch of
   CreatedNewConnection -> 0
-  CloseConnection -> 1
-  CloseSocket -> 2
-  CloseEndPoint -> 3
-  ProbeSocket -> 4
-  ProbeSocketAck -> 5
+  CloseConnection      -> 1
+  CloseSocket          -> 2
+  CloseEndPoint        -> 3
+  ProbeSocket          -> 4
+  ProbeSocketAck       -> 5
 
 -- | Response sent by /B/ to /A/ when /A/ tries to connect
 data ConnectionRequestResponse =
@@ -121,9 +121,8 @@ decodeConnectionRequestResponse w32 = case w32 of
 encodeConnectionRequestResponse :: ConnectionRequestResponse -> Word32
 encodeConnectionRequestResponse crr = case crr of
   ConnectionRequestAccepted -> 0
-  ConnectionRequestInvalid -> 1
-  ConnectionRequestCrossed -> 2
-
+  ConnectionRequestInvalid  -> 1
+  ConnectionRequestCrossed  -> 2
 
 -- | Start a server at the specified address.
 --
