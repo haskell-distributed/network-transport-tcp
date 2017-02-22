@@ -9,7 +9,6 @@ module Network.Transport.TCP.Internal
   , forkServer
   , recvWithLength
   , recvExact
-  , recvInt32
   , recvWord32
   , encodeWord32
   , tryCloseSocket
@@ -20,8 +19,8 @@ import Prelude hiding (catch)
 #endif
 
 import Network.Transport.Internal
-  ( decodeInt32
-  , encodeInt32
+  ( decodeWord32
+  , encodeWord32
   , void
   , tryIO
   , forkIOWithUnmask
@@ -65,7 +64,6 @@ import Control.Exception (SomeException, catch, bracketOnError, throwIO, mask_)
 import Control.Applicative ((<$>), (<*>))
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS (length, concat, null)
-import Data.Int (Int32)
 import Data.ByteString.Lazy.Internal (smallChunkSize)
 
 -- | Control headers
@@ -186,18 +184,9 @@ forkServer host port backlog reuseAddr terminationHandler requestHandler = do
 recvWithLength :: N.Socket -> IO [ByteString]
 recvWithLength sock = recvWord32 sock >>= recvExact sock
 
--- | Receive a 32-bit integer
-recvInt32 :: Num a => N.Socket -> IO a
-recvInt32 sock = decodeInt32 . BS.concat <$> recvExact sock 4
-
 -- | Receive a 32-bit unsigned integer
 recvWord32 :: N.Socket -> IO Word32
-recvWord32 = recvInt32
-
--- | Encode a Word32. Alias for network-transport's encodeInt32, which in fact
---   encodes an arbitrary Enum.
-encodeWord32 :: Word32 -> ByteString
-encodeWord32 = encodeInt32
+recvWord32 = fmap (decodeWord32 . BS.concat) . flip recvExact 4
 
 -- | Close a socket, ignoring I/O exceptions.
 tryCloseSocket :: N.Socket -> IO ()

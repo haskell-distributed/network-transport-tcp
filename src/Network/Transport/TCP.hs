@@ -56,7 +56,6 @@ import Network.Transport.TCP.Internal
   , decodeConnectionRequestResponse
   , forkServer
   , recvWithLength
-  , recvInt32
   , recvWord32
   , encodeWord32
   , tryCloseSocket
@@ -980,7 +979,7 @@ handleIncomingMessages (ourEndPoint, theirEndPoint) = do
     -- exception thrown by 'recv'.
     go :: N.Socket -> IO ()
     go sock = do
-      lcid <- recvWord32 sock :: IO Word32
+      lcid <- recvWord32 sock :: IO LightweightConnectionId
       if lcid >= firstNonReservedLightweightConnectionId
         then do
           readMessage sock lcid
@@ -1762,7 +1761,7 @@ socketToEndPoint (EndPointAddress ourAddress) theirAddress reuseAddr noDelay kee
         mapIOException failed $ do
           sendMany sock
                    (encodeWord32 theirEndPointId : prependLength [ourAddress])
-          recvInt32 sock
+          recvWord32 sock
       case decodeConnectionRequestResponse response of
         Nothing -> throwIO (failed . userError $ "Unexpected response")
         Just r  -> return (sock, r)
