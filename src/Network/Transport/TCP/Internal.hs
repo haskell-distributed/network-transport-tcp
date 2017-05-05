@@ -15,6 +15,8 @@ module Network.Transport.TCP.Internal
   , tryShutdownSocketBoth
   , decodeSockAddr
   , EndPointId
+  , TCPInternalSettings(..)
+  , defaultTCPInternalSettings
   , encodeEndPointAddress
   , decodeEndPointAddress
   ) where
@@ -42,7 +44,7 @@ import qualified Network.Socket as N
   , ServiceName
   , Socket
   , SocketType(Stream)
-  , SocketOption(ReuseAddr)
+  , SocketOption(ReuseAddr, CustomSockOpt)
   , getAddrInfo
   , defaultHints
   , socket
@@ -99,6 +101,21 @@ import qualified Data.ByteString.Char8 as BSC (unpack, pack)
 
 -- | Local identifier for an endpoint within this transport
 type EndPointId = Word32
+
+-- | Parameters that have to be passed to every socket function
+-- because they cannot be set on the socket permanently.
+data TCPInternalSettings = TCPInternalSettings {
+    -- | Whether to set TCP_QUICKACK after every `recv` and to what.
+    --
+    -- See the `tcpForceQuickAck` setting in "Network.Transport.TCP"
+    -- for which OSs this setting works on.
+    tcpInternalForceQuickAck :: Maybe Bool
+  }
+
+-- | Default internal TCP parameters.
+defaultTCPInternalSettings = TCPInternalSettings {
+    tcpInternalForceQuickAck = Nothing
+  }
 
 -- | Control headers
 data ControlHeader =
@@ -253,16 +270,16 @@ forkServer host port backlog reuseAddr errorHandler terminationHandler requestHa
 --   on the length.
 --   If the length (first 'Word32' received) is greater than the limit then
 --   an exception is thrown.
-recvWithLength :: Word32 -> N.Socket -> IO [ByteString]
-recvWithLength limit sock = do
-  len <- recvWord32 sock
+recvWithLength :: TCPInternalSettings -> Word32 -> N.Socket -> IO [ByteString]
+recvWithLength settings limit sock = do
+  len <- recvWord32 settings sock
   when (len > limit) $
     throwIO (userError "recvWithLength: limit exceeded")
-  recvExact sock len
+  recvExact settings sock len
 
 -- | Receive a 32-bit unsigned integer
-recvWord32 :: N.Socket -> IO Word32
-recvWord32 = fmap (decodeWord32 . BS.concat) . flip recvExact 4
+recvWord32 :: TCPInternalSettings -> N.Socket -> IO Word32
+recvWord32 settings = fmap (decodeWord32 . BS.concat) . flip (recvExact settings) 4
 
 -- | Close a socket, ignoring I/O exceptions.
 tryCloseSocket :: N.Socket -> IO ()
@@ -278,15 +295,30 @@ tryShutdownSocketBoth sock = void . tryIO $
 --
 -- Throws an I/O exception if the socket closes before the specified
 -- number of bytes could be read
-recvExact :: N.Socket        -- ^ Socket to read from
+recvExact :: TCPInternalSettings -- ^ Settings for specific TCP behaviour
+          -> N.Socket        -- ^ Socket to read from
           -> Word32          -- ^ Number of bytes to read
           -> IO [ByteString] -- ^ Data read
-recvExact sock len = go [] len
+recvExact settings sock len = go [] len
   where
     go :: [ByteString] -> Word32 -> IO [ByteString]
     go acc 0 = return (reverse acc)
     go acc l = do
       bs <- NBS.recv sock (fromIntegral l `min` smallChunkSize)
+      -- If forcing TCP_QUICKACK is enabled, set it after every recv()
+      -- (see also http://stackoverflow.com/questions/1615447/disable-tcp-delayed-acks).
+      -- Currently, this location is the only call to recv() in the package.
+      -- If other direct calls to `NBS.recv` are added anywhere, this
+      -- logic needs to be applied there as well!
+      case tcpInternalForceQuickAck settings of
+        Nothing -> return ()
+#ifdef linux_HOST_OS
+        Just forceVal -> do
+          let val = if forceVal then 1 else 0
+          N.setSocketOption sock (N.CustomSockOpt (6, 12)) val -- 6 is IPPROTO_TCP, 12 is TCP_QUICKACK
+#else
+        Just _forceVal -> return () -- Non-Linux OSs don't have TCP_QUICKACK.
+#endif
       if BS.null bs
         then throwIO (userError "recvExact: Socket closed")
         else go (bs : acc) (l - fromIntegral (BS.length bs))

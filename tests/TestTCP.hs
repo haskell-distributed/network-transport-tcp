@@ -52,6 +52,8 @@ import Network.Transport.TCP.Internal
   , recvWord32
   , forkServer
   , recvWithLength
+  , TCPInternalSettings
+  , defaultTCPInternalSettings
   , encodeEndPointAddress
   , decodeEndPointAddress
   )
@@ -106,6 +108,10 @@ instance Traceable N.AddrInfo where
 
 instance Traceable TransportInternals where
   trace = const Nothing
+
+-- | Settings used for these tests
+settings :: TCPInternalSettings
+settings = defaultTCPInternalSettings
 
 -- Test that the server gets a ConnectionClosed message when the client closes
 -- the socket without sending an explicit control message to the server first
@@ -175,17 +181,17 @@ testEarlyDisconnect = do
       -- Listen for incoming messages
       (clientPort, _) <- forkServer "127.0.0.1" "0" 5 True throwIO throwIO $ \socketFree (sock, _) -> do
         -- Initial setup
-        0 <- recvWord32 sock
-        _ <- recvWithLength maxBound sock
+        0 <- recvWord32 settings sock
+        _ <- recvWithLength settings maxBound sock
         sendMany sock [encodeWord32 (encodeConnectionRequestResponse ConnectionRequestAccepted)]
 
         -- Server opens  a logical connection
-        Just CreatedNewConnection <- decodeControlHeader <$> recvWord32 sock
-        1024 <- recvWord32 sock :: IO LightweightConnectionId
+        Just CreatedNewConnection <- decodeControlHeader <$> recvWord32 settings sock
+        1024 <- recvWord32 settings sock :: IO LightweightConnectionId
 
         -- Server sends a message
-        1024 <- recvWord32 sock
-        ["ping"] <- recvWithLength maxBound sock
+        1024 <- recvWord32 settings sock
+        ["ping"] <- recvWithLength settings maxBound sock
 
         -- Reply
         sendMany sock [
@@ -201,7 +207,7 @@ testEarlyDisconnect = do
       putMVar clientAddr ourAddress
 
       -- Connect to the server
-      Right (_, sock, ConnectionRequestAccepted) <- readMVar serverAddr >>= \addr -> socketToEndPoint ourAddress addr True False False Nothing Nothing
+      Right (_, sock, ConnectionRequestAccepted) <- readMVar serverAddr >>= \addr -> socketToEndPoint ourAddress addr True False Nothing False Nothing Nothing
 
       -- Open a new connection
       sendMany sock [
@@ -287,17 +293,17 @@ testEarlyCloseSocket = do
       -- Listen for incoming messages
       (clientPort, _) <- forkServer "127.0.0.1" "0" 5 True throwIO throwIO $ \socketFree (sock, _) -> do
         -- Initial setup
-        0 <- recvWord32 sock
-        _ <- recvWithLength maxBound sock
+        0 <- recvWord32 settings sock
+        _ <- recvWithLength settings maxBound sock
         sendMany sock [encodeWord32 (encodeConnectionRequestResponse ConnectionRequestAccepted)]
 
         -- Server opens a logical connection
-        Just CreatedNewConnection <- decodeControlHeader <$> recvWord32 sock
-        1024 <- recvWord32 sock :: IO LightweightConnectionId
+        Just CreatedNewConnection <- decodeControlHeader <$> recvWord32 settings sock
+        1024 <- recvWord32 settings sock :: IO LightweightConnectionId
 
         -- Server sends a message
-        1024 <- recvWord32 sock
-        ["ping"] <- recvWithLength maxBound sock
+        1024 <- recvWord32 settings sock
+        ["ping"] <- recvWithLength settings maxBound sock
 
         -- Reply
         sendMany sock [
@@ -318,7 +324,7 @@ testEarlyCloseSocket = do
       putMVar clientAddr ourAddress
 
       -- Connect to the server
-      Right (_, sock, ConnectionRequestAccepted) <- readMVar serverAddr >>= \addr -> socketToEndPoint ourAddress addr True False False Nothing Nothing
+      Right (_, sock, ConnectionRequestAccepted) <- readMVar serverAddr >>= \addr -> socketToEndPoint ourAddress addr True False Nothing False Nothing Nothing
 
       -- Open a new connection
       sendMany sock [
@@ -412,20 +418,20 @@ testIgnoreCloseSocket = do
     theirAddress <- readMVar serverAddr
 
     -- Connect to the server
-    Right (_, sock, ConnectionRequestAccepted) <- socketToEndPoint ourAddress theirAddress True False False Nothing Nothing
+    Right (_, sock, ConnectionRequestAccepted) <- socketToEndPoint ourAddress theirAddress True False Nothing False Nothing Nothing
     putMVar connectionEstablished ()
 
     -- Server connects to us, and then closes the connection
-    Just CreatedNewConnection <- decodeControlHeader <$> recvWord32 sock
-    1024 <- recvWord32 sock :: IO LightweightConnectionId
+    Just CreatedNewConnection <- decodeControlHeader <$> recvWord32 settings sock
+    1024 <- recvWord32 settings sock :: IO LightweightConnectionId
 
-    Just CloseConnection <- decodeControlHeader <$> recvWord32 sock
-    1024 <- recvWord32 sock :: IO LightweightConnectionId
+    Just CloseConnection <- decodeControlHeader <$> recvWord32 settings sock
+    1024 <- recvWord32 settings sock :: IO LightweightConnectionId
 
     -- Server will now send a CloseSocket request as its refcount reached 0
     tlog "Waiting for CloseSocket request"
-    Just CloseSocket <- decodeControlHeader <$> recvWord32 sock
-    _ <- recvWord32 sock :: IO LightweightConnectionId
+    Just CloseSocket <- decodeControlHeader <$> recvWord32 settings sock
+    _ <- recvWord32 settings sock :: IO LightweightConnectionId
 
     -- But we ignore it and request another connection in the other direction
     tlog "Ignoring it, requesting another connection"
@@ -498,20 +504,20 @@ testBlockAfterCloseSocket = do
     theirAddress <- readMVar serverAddr
 
     -- Connect to the server
-    Right (_, sock, ConnectionRequestAccepted) <- socketToEndPoint ourAddress theirAddress True False False Nothing Nothing
+    Right (_, sock, ConnectionRequestAccepted) <- socketToEndPoint ourAddress theirAddress True False Nothing False Nothing Nothing
     putMVar connectionEstablished ()
 
     -- Server connects to us, and then closes the connection
-    Just CreatedNewConnection <- decodeControlHeader <$> recvWord32 sock
-    1024 <- recvWord32 sock :: IO LightweightConnectionId
+    Just CreatedNewConnection <- decodeControlHeader <$> recvWord32 settings sock
+    1024 <- recvWord32 settings sock :: IO LightweightConnectionId
 
-    Just CloseConnection <- decodeControlHeader <$> recvWord32 sock
-    1024 <- recvWord32 sock :: IO LightweightConnectionId
+    Just CloseConnection <- decodeControlHeader <$> recvWord32 settings sock
+    1024 <- recvWord32 settings sock :: IO LightweightConnectionId
 
     -- Server will now send a CloseSocket request as its refcount reached 0
     tlog "Waiting for CloseSocket request"
-    Just CloseSocket <- decodeControlHeader <$> recvWord32 sock
-    _ <- recvWord32 sock :: IO LightweightConnectionId
+    Just CloseSocket <- decodeControlHeader <$> recvWord32 settings sock
+    _ <- recvWord32 settings sock :: IO LightweightConnectionId
 
     unblocked <- newMVar False
 
@@ -519,7 +525,7 @@ testBlockAfterCloseSocket = do
     -- responding to the CloseSocket request (in this case, we
     -- respond by sending a ConnectionRequest)
     forkTry $ do
-      recvWord32 sock
+      recvWord32 settings sock
       readMVar unblocked >>= guard
       putMVar clientDone ()
 
@@ -564,7 +570,7 @@ testUnnecessaryConnect numThreads = do
       forkTry $ do
         -- It is possible that the remote endpoint just rejects the request by closing the socket
         -- immediately (depending on far the remote endpoint got with the initialization)
-        response <- readMVar serverAddr >>= \addr -> socketToEndPoint ourAddress addr True False False Nothing Nothing
+        response <- readMVar serverAddr >>= \addr -> socketToEndPoint ourAddress addr True False Nothing False Nothing Nothing
         case response of
           Right (_, _, ConnectionRequestAccepted) ->
             -- We don't close this socket because we want to keep this connection open
@@ -645,8 +651,8 @@ testReconnect = do
   -- Server
   (serverPort, _) <- forkServer "127.0.0.1" "0" 5 True throwIO throwIO $ \socketFree (sock, _) -> do
     -- Accept the connection
-    Right 0  <- tryIO $ recvWord32 sock
-    Right _  <- tryIO $ recvWithLength maxBound sock
+    Right 0  <- tryIO $ recvWord32 settings sock
+    Right _  <- tryIO $ recvWithLength settings maxBound sock
 
     -- The first time we close the socket before accepting the logical connection
     count <- modifyMVar counter $ \i -> return (i + 1, i)
@@ -668,15 +674,15 @@ testReconnect = do
         -- On the third and fourth requests, a new logical connection is
         -- accepted.
         -- On the third request the socket then closes.
-        Right (Just CreatedNewConnection) <- tryIO $ decodeControlHeader <$> recvWord32 sock
-        connId <- recvWord32 sock :: IO LightweightConnectionId
+        Right (Just CreatedNewConnection) <- tryIO $ decodeControlHeader <$> recvWord32 settings sock
+        connId <- recvWord32 settings sock :: IO LightweightConnectionId
 
         when (count > 2) $ do
           -- On the fourth request, a message is received and then the socket
           -- is closed.
-          Right connId' <- tryIO $ (recvWord32 sock :: IO LightweightConnectionId)
+          Right connId' <- tryIO $ (recvWord32 settings sock :: IO LightweightConnectionId)
           True <- return $ connId == connId'
-          Right ["ping"] <- tryIO $ recvWithLength maxBound sock
+          Right ["ping"] <- tryIO $ recvWithLength settings maxBound sock
           putMVar serverDone ()
 
     return ()
@@ -771,16 +777,16 @@ testUnidirectionalError = do
     -- fail, but we don't want to close that socket at that point (which
     -- would shutdown the socket in the other direction)
     void . (try :: IO () -> IO (Either SomeException ())) $ do
-      0 <- recvWord32 sock
-      _ <- recvWithLength maxBound sock
+      0 <- recvWord32 settings sock
+      _ <- recvWithLength settings maxBound sock
       () <- sendMany sock [encodeWord32 (encodeConnectionRequestResponse ConnectionRequestAccepted)]
 
-      Just CreatedNewConnection <- decodeControlHeader <$> recvWord32 sock
-      connId <- recvWord32 sock :: IO LightweightConnectionId
+      Just CreatedNewConnection <- decodeControlHeader <$> recvWord32 settings sock
+      connId <- recvWord32 settings sock :: IO LightweightConnectionId
 
-      connId' <- recvWord32 sock :: IO LightweightConnectionId
+      connId' <- recvWord32 settings sock :: IO LightweightConnectionId
       True <- return $ connId == connId'
-      ["ping"] <- recvWithLength maxBound sock
+      ["ping"] <- recvWithLength settings maxBound sock
       putMVar serverGotPing ()
 
     -- Must read the clientDone MVar so that we don't close the socket

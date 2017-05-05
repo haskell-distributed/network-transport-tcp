@@ -60,6 +60,8 @@ import Network.Transport.TCP.Internal
   , tryShutdownSocketBoth
   , decodeSockAddr
   , EndPointId
+  , TCPInternalSettings(..)
+  , defaultTCPInternalSettings
   , encodeEndPointAddress
   , decodeEndPointAddress
   )
@@ -476,6 +478,25 @@ data TCPParameters = TCPParameters {
     -- | Should we set TCP_NODELAY on connection sockets?
     -- Defaults to False.
   , tcpNoDelay :: Bool
+    -- | Should we enforce TCP_QUICKACK on connection sockets?
+    --
+    -- This setting is ignored on non-Linux systems, as they don't
+    -- have the TCP_QUICKACK socket option.
+    --
+    -- Enabling this on Linux < 2.4.4 will fail; the setting is NOT
+    -- ignored in that case, and you have to ensure that it's off
+    -- when using such an old Linux version.
+    --
+    -- Note that because TCP_QUICKACK is not a permanent socket option
+    -- (the kernel may reset it at any time), forcing it on or off
+    -- requires setting the socket option after every socket `recv`.
+    --
+    -- Setting it to `Nothing` does not set the socket option and
+    -- thus lets Linux do its heuristics; setting it to `Just True`
+    -- or `Just False` forces it on/off on supported platforms.
+    --
+    -- Defaults to Nothing.
+  , tcpForceQuickAck :: Maybe Bool
     -- | Value of TCP_USER_TIMEOUT in milliseconds
   , tcpKeepAlive :: Bool
     -- | Should we set TCP_KEEPALIVE on connection sockets?
@@ -622,6 +643,7 @@ defaultTCPParameters = TCPParameters {
   , tcpReuseServerAddr = True
   , tcpReuseClientAddr = True
   , tcpNoDelay         = False
+  , tcpForceQuickAck   = Nothing
   , tcpKeepAlive       = False
   , tcpUserTimeout     = Nothing
   , tcpNewQDisc        = simpleUnboundedQDisc
@@ -926,10 +948,10 @@ handleConnectionRequest transport socketClosed (sock, sockAddr) = handle handleE
     -- The peer must send our identifier and their address promptly, if a
     -- timeout is set.
     mAddrInfo <- maybe (fmap Just) System.Timeout.timeout connTimeout $ do
-      ourEndPointId <- recvWord32 sock
+      ourEndPointId <- recvWord32 settings sock
       let maxAddressLength = tcpMaxAddressLength $ transportParams transport
       theirAddress <- EndPointAddress . BS.concat <$>
-        recvWithLength maxAddressLength sock
+        recvWithLength settings maxAddressLength sock
       return (ourEndPointId, theirAddress)
     (ourEndPointId, theirAddress) <- case mAddrInfo of
       Nothing -> throwIO (userError "handleConnectionRequest: timed out")
@@ -965,6 +987,10 @@ handleConnectionRequest transport socketClosed (sock, sockAddr) = handle handleE
           throwIO $ userError "Transport closed"
       void $ go ourEndPoint theirAddress
   where
+    settings = defaultTCPInternalSettings
+      { tcpInternalForceQuickAck = tcpForceQuickAck $ transportParams transport
+      }
+
     go :: LocalEndPoint -> EndPointAddress -> IO ()
     go ourEndPoint theirAddress = do
       -- This runs in a thread that will never be killed
@@ -1063,6 +1089,10 @@ handleIncomingMessages params (ourEndPoint, theirEndPoint) = do
       Left err -> prematureExit err
       Right sock -> tryIO (go sock) >>= either prematureExit return
   where
+    settings = defaultTCPInternalSettings
+      { tcpInternalForceQuickAck = tcpForceQuickAck params
+      }
+
     -- Dispatch
     --
     -- If a recv throws an exception this will be caught top-level and
@@ -1073,7 +1103,7 @@ handleIncomingMessages params (ourEndPoint, theirEndPoint) = do
     -- exception thrown by 'recv'.
     go :: N.Socket -> IO ()
     go sock = do
-      lcid <- recvWord32 sock :: IO LightweightConnectionId
+      lcid <- recvWord32 settings sock :: IO LightweightConnectionId
       if lcid >= firstNonReservedLightweightConnectionId
         then do
           readMessage sock lcid
@@ -1081,13 +1111,13 @@ handleIncomingMessages params (ourEndPoint, theirEndPoint) = do
         else
           case decodeControlHeader lcid of
             Just CreatedNewConnection -> do
-              recvWord32 sock >>= createdNewConnection
+              recvWord32 settings sock >>= createdNewConnection
               go sock
             Just CloseConnection -> do
-              recvWord32 sock >>= closeConnection
+              recvWord32 settings sock >>= closeConnection
               go sock
             Just CloseSocket -> do
-              didClose <- recvWord32 sock >>= closeSocket sock
+              didClose <- recvWord32 settings sock >>= closeSocket sock
               unless didClose $ go sock
             Just CloseEndPoint -> do
               let closeRemoteEndPoint vst = do
@@ -1279,7 +1309,7 @@ handleIncomingMessages params (ourEndPoint, theirEndPoint) = do
     -- overhead
     readMessage :: N.Socket -> LightweightConnectionId -> IO ()
     readMessage sock lcid =
-      recvWithLength recvLimit sock >>=
+      recvWithLength settings recvLimit sock >>=
         qdiscEnqueue' ourQueue theirAddr . Received (connId lcid)
 
     -- Stop probing a connection as a result of receiving a probe ack.
@@ -1446,6 +1476,7 @@ setupRemoteEndPoint params (ourEndPoint, theirEndPoint) connTimeout = do
                                theirAddress
                                (tcpReuseClientAddr params)
                                (tcpNoDelay params)
+                               (tcpForceQuickAck params)
                                (tcpKeepAlive params)
                                (tcpUserTimeout params)
                                connTimeout
@@ -1490,7 +1521,7 @@ setupRemoteEndPoint params (ourEndPoint, theirEndPoint) connTimeout = do
         let handler :: SomeException -> IO (TransportError ConnectErrorCode)
             handler err = return (TransportError ConnectFailed (show err))
         err <- handle handler $ do
-          actualHost <- recvWithLength (tcpMaxReceiveLength params) sock
+          actualHost <- recvWithLength settings (tcpMaxReceiveLength params) sock
           return (TransportError ConnectFailed ("setupRemoteEndPoint: Host mismatch " ++ BSC.unpack (BS.concat actualHost)))
         resolveInit (ourEndPoint, theirEndPoint) (RemoteEndPointInvalid err)
         tryCloseSocket sock `finally` putMVar socketClosedVar ()
@@ -1510,6 +1541,10 @@ setupRemoteEndPoint params (ourEndPoint, theirEndPoint) connTimeout = do
     ourAddress      = localAddress ourEndPoint
     theirAddress    = remoteAddress theirEndPoint
     invalidAddress  = TransportError ConnectNotFound
+
+    settings = defaultTCPInternalSettings
+      { tcpInternalForceQuickAck = tcpForceQuickAck params
+      }
 
 -- | Send a CloseSocket request if the remote endpoint is unused
 closeIfUnused :: EndPointPair -> IO ()
@@ -1888,12 +1923,13 @@ socketToEndPoint :: EndPointAddress -- ^ Our address
                  -> EndPointAddress -- ^ Their address
                  -> Bool            -- ^ Use SO_REUSEADDR?
                  -> Bool            -- ^ Use TCP_NODELAY
+                 -> Maybe Bool      -- ^ Use TCP_QUICKACK
                  -> Bool            -- ^ Use TCP_KEEPALIVE
                  -> Maybe Int       -- ^ Maybe TCP_USER_TIMEOUT
                  -> Maybe Int       -- ^ Timeout for connect
                  -> IO (Either (TransportError ConnectErrorCode)
                                (MVar (), N.Socket, ConnectionRequestResponse))
-socketToEndPoint (EndPointAddress ourAddress) theirAddress reuseAddr noDelay keepAlive
+socketToEndPoint (EndPointAddress ourAddress) theirAddress reuseAddr noDelay mForceQuickAck keepAlive
                  mUserTimeout timeout =
   try $ do
     (host, port, theirEndPointId) <- case decodeEndPointAddress theirAddress of
@@ -1916,7 +1952,7 @@ socketToEndPoint (EndPointAddress ourAddress) theirAddress reuseAddr noDelay kee
         mapIOException failed $ do
           sendMany sock
                    (encodeWord32 theirEndPointId : prependLength [ourAddress])
-          recvWord32 sock
+          recvWord32 settings sock
       case decodeConnectionRequestResponse response of
         Nothing -> throwIO (failed . userError $ "Unexpected response")
         Just r  -> do
@@ -1926,6 +1962,10 @@ socketToEndPoint (EndPointAddress ourAddress) theirAddress reuseAddr noDelay kee
     createSocket :: N.AddrInfo -> IO N.Socket
     createSocket addr = mapIOException insufficientResources $
       N.socket (N.addrFamily addr) N.Stream N.defaultProtocol
+
+    settings = defaultTCPInternalSettings
+      { tcpInternalForceQuickAck = mForceQuickAck
+      }
 
     invalidAddress        = TransportError ConnectNotFound . show
     insufficientResources = TransportError ConnectInsufficientResources . show
