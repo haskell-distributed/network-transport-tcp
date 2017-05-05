@@ -40,6 +40,7 @@ import Control.Exception (throwIO)
 import Control.Category ((>>>))
 import Control.Concurrent.MVar
 import Control.Concurrent.Chan
+import Foreign.C.Types (CInt)
 import System.IO.Unsafe (unsafePerformIO)
 import Data.Accessor (Accessor, accessor, (^=), (^.), (^:))
 import qualified Data.Accessor.Container as DAC (mapMaybe)
@@ -94,7 +95,7 @@ type PortNumber  = String
 type HostAddress = String
 
 data SocketType   = Stream
-data SocketOption = ReuseAddr
+data SocketOption = ReuseAddr | CustomSockOpt (CInt, CInt)
 data ShutdownCmd  = ShutdownSend
 
 data Family
@@ -185,6 +186,7 @@ defaultProtocol = error "defaultProtocol not implemented"
 
 setSocketOption :: Socket -> SocketOption -> Int -> IO ()
 setSocketOption _ ReuseAddr 1 = return ()
+setSocketOption _ CustomSockOpt{} _ = return ()
 setSocketOption _ _ _ = error "setSocketOption: unsupported arguments"
 
 accept :: Socket -> IO (Socket, SockAddr)
