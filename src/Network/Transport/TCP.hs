@@ -474,7 +474,7 @@ data TCPParameters = TCPParameters {
     -- Defaults to True.
   , tcpReuseClientAddr :: Bool
     -- | Should we set TCP_NODELAY on connection sockets?
-    -- Defaults to True.
+    -- Defaults to False.
   , tcpNoDelay :: Bool
     -- | Value of TCP_USER_TIMEOUT in milliseconds
   , tcpKeepAlive :: Bool
