@@ -1044,7 +1044,7 @@ handleConnectionRequest transport socketClosed (sock, sockAddr) = handle handleE
                 let params = transportParams transport
                 void $ tryIO $ System.Timeout.timeout
                     (maybe (-1) id $ transportConnectTimeout params) $ do
-                  sendMany (remoteSocket vst)
+                  sendOn vst
                     [encodeWord32 (encodeControlHeader ProbeSocket)]
                   threadDelay maxBound
                 -- Discard the connection if this thread is not killed (i.e. the
@@ -1152,13 +1152,18 @@ handleIncomingMessages params (ourEndPoint, theirEndPoint) =
                   return RemoteEndPointClosed
                 _                           -> return s
             Just ProbeSocket -> do
-              forkIO $ sendMany sock [encodeWord32 (encodeControlHeader ProbeSocketAck)]
+              forkIO $
+                withMVar theirState $ \s -> case s of
+                  RemoteEndPointValid vst     -> do
+                    sendOn vst [encodeWord32 (encodeControlHeader ProbeSocketAck)]
+                  _ ->
+                    return ()
               go sock
             Just ProbeSocketAck -> do
               stopProbing
               go sock
             Nothing ->
-              throwIO $ userError "Invalid control request"
+              throwIO $ userError $ "Invalid control request: " ++ show lcid
 
     -- Create a new connection
     createdNewConnection :: LightweightConnectionId -> IO ()
