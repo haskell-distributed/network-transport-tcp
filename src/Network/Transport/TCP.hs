@@ -127,6 +127,7 @@ import Control.Concurrent.MVar
   , newEmptyMVar
   , withMVar
   )
+import Control.Concurrent.Async (async, wait)
 import Control.Category ((>>>))
 import Control.Applicative ((<$>))
 import Control.Monad (when, unless, join, mplus, (<=<))
@@ -144,6 +145,7 @@ import Control.Exception
   , finally
   , catch
   , bracket
+  , mask
   , mask_
   )
 import Data.IORef (IORef, newIORef, writeIORef, readIORef, writeIORef)
@@ -151,7 +153,7 @@ import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS (concat)
 import qualified Data.ByteString.Char8 as BSC (pack, unpack)
 import Data.Bits (shiftL, (.|.))
-import Data.Maybe (isJust)
+import Data.Maybe (isJust, isNothing, fromJust)
 import Data.Word (Word32)
 import Data.Set (Set)
 import qualified Data.Set as Set
@@ -444,7 +446,9 @@ data ValidRemoteEndPointState = ValidRemoteEndPointState
      -- | When the connection is being probed, yields an IO action that can be
      -- used to release any resources dedicated to the probing.
   ,  remoteProbing       :: Maybe (IO ())
-  ,  remoteSendLock      :: !(MVar ())
+     -- | MVar protects the socket usage by the concurrent threads and
+     -- prohibits its usage after SomeException (see 'sendOn').
+  ,  remoteSendLock      :: !(MVar (Maybe SomeException))
      -- | An IO which returns when the socket (remoteSocket) has been closed.
      --   The program/thread which created the socket is always responsible
      --   for closing it, but sometimes other threads need to know when this
@@ -1030,7 +1034,7 @@ handleConnectionRequest transport socketClosed (sock, sockAddr) = handle handleE
               [encodeWord32 (encodeConnectionRequestResponse ConnectionRequestCrossed)]
             probeIfValid theirEndPoint
           else do
-            sendLock <- newMVar ()
+            sendLock <- newMVar Nothing
             let vst = ValidRemoteEndPointState
                         {  remoteSocket        = sock
                         ,  remoteSocketClosed  = socketClosed
@@ -1513,7 +1517,7 @@ setupRemoteEndPoint params (ourEndPoint, theirEndPoint) connTimeout = do
       -- (readMVar socketClosedVar), and we'll take care of closing it up
       -- once handleIncomingMessages has finished.
       Right (socketClosedVar, sock, ConnectionRequestAccepted) -> do
-        sendLock <- newMVar ()
+        sendLock <- newMVar Nothing
         let vst = ValidRemoteEndPointState
                     {  remoteSocket        = sock
                     ,  remoteSocketClosed  = readMVar socketClosedVar
@@ -1887,9 +1891,33 @@ findRemoteEndPoint ourEndPoint theirAddress findOrigin mtimer = go
         const $ readMVar mv
 
 -- | Send a payload over a heavyweight connection (thread safe)
+--
+-- The socket cannot be used for sending after the non-atomic 'sendMany'
+-- is interrupted - otherwise, the other side may get the msg corrupted.
+--
+-- There are two types of possible exceptions here:
+-- 1) Outer non-IOExceptions (like 'ProcessLinkException').
+-- 2) IOExceptions (inner or outer).
+-- On an 'IOException' the remote endpoint is failed (see 'runScheduledAction',
+-- for example) and its socket is not supposed to be used again.
+--
+-- With 'async' the code is run in a new thread which is not-targeted (and
+-- thus, not interrupted) by the 1st type of exceptions. With 'remoteSendLock'
+-- we protect the socket usage by the concurrent threads, as well as prevent
+-- that usage after SomeException.
 sendOn :: ValidRemoteEndPointState -> [ByteString] -> IO ()
-sendOn vst bs = withMVar (remoteSendLock vst) $ \() ->
-  sendMany (remoteSocket vst) bs
+sendOn vst bs = wait =<< async
+  (mask $ \restore -> do
+    let lock = remoteSendLock vst
+    bad <- takeMVar lock
+    when (isNothing bad) $
+      restore (sendMany (remoteSocket vst) bs) `catch` \ex -> do
+        putMVar lock (Just ex)
+        throwIO ex
+    putMVar lock bad
+    unless (isNothing bad) $
+      throwIO . userError $ "sendOn failed earlier with: "
+                          ++ show (fromJust bad))
 
 --------------------------------------------------------------------------------
 -- Scheduling actions                                                         --
